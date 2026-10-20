@@ -142,3 +142,96 @@ def test_mismatched_source_parse_keeps_lexical_fallback() -> None:
     parsed = parse_python_source(source.replace("SELECT", "SELECT\u200b"), "query.py")
     findings = output_handling.analyze(source, "query.py", "python", python_ast=parsed)
     assert any(finding.rule_id == "OH1" for finding in findings)
+
+
+def test_intervening_import_keeps_lexical_finding() -> None:
+    source = _database_source(
+        'import plugin\ncursor.execute("SELECT name FROM users WHERE id = %s", (output,))'
+    )
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        'import sqlite3\nconnection = sqlite3.connect("example", factory=custom)\ncursor = connection.cursor()',
+        'import psycopg\nconnection = psycopg.connect("example")\ncursor = connection.cursor(factory=custom)',
+        'import psycopg\nconnection = psycopg.connect("example")\ncursor = connection.cursor()\nsetattr(cursor, "execute", custom)',
+        'import psycopg\nconnection = psycopg.connect("example")\ncursor = connection.cursor()\ndef patch():\n    cursor.execute = custom',
+    ],
+)
+def test_custom_factories_and_reflective_or_deferred_writes_stay_conservative(setup: str) -> None:
+    source = setup + '\ncursor.execute("SELECT name FROM users WHERE id = %s", (output,))'
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
+
+
+def test_proof_budget_exhaustion_retains_lexical_finding() -> None:
+    source = _database_source('cursor.execute("SELECT name FROM users WHERE id = %s", (output,))')
+    source += "0\n" * 10_001
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
+
+
+def test_outer_binding_cannot_hide_nested_sql_interpolation() -> None:
+    source = _database_source(
+        'cursor.execute("SELECT \'100%\' WHERE value=?", (cursor.execute("SELECT " + output),))',
+        "sqlite3",
+    )
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
+
+
+def test_relative_driver_import_is_not_trusted() -> None:
+    source = (
+        "from .sqlite3 import connect\n"
+        'connection = connect("example")\n'
+        "cursor = connection.cursor()\n"
+        "cursor.execute(\"SELECT '100%' WHERE value=?\", (output,))\n"
+    )
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
+
+
+@pytest.mark.parametrize("pattern", ["cursor", "[first, *cursor]", '{"item": value, **cursor}'])
+def test_match_capture_rebinding_stays_conservative(pattern: str) -> None:
+    source = _database_source(
+        f"match custom:\n    case {pattern}:\n"
+        "        cursor.execute(\"SELECT '100%' WHERE value=?\", (output,))"
+    )
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "with manager:\n    cursor.execute(\"SELECT '100%' WHERE value=?\", (output,))",
+        "other = external.attribute\ncursor.execute(\"SELECT '100%' WHERE value=?\", (output,))",
+        "other = external[0]\ncursor.execute(\"SELECT '100%' WHERE value=?\", (output,))",
+        "other = external + value\ncursor.execute(\"SELECT '100%' WHERE value=?\", (output,))",
+    ],
+)
+def test_implicit_side_effect_before_query_stays_conservative(statement: str) -> None:
+    source = _database_source(statement, "sqlite3")
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
+
+
+def test_conditional_driver_binding_stays_conservative() -> None:
+    source = (
+        "if enabled:\n    import sqlite3\n"
+        'connection = sqlite3.connect("example")\n'
+        "cursor = connection.cursor()\n"
+        "cursor.execute(\"SELECT '100%' WHERE value=?\", (output,))\n"
+    )
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
+
+
+def test_many_queries_exhaust_optional_precision_proof_conservatively() -> None:
+    source = _database_source(
+        'cursor.execute("SELECT name FROM users WHERE id = %s", (output,))\n' * 1000
+    )
+    findings = output_handling.analyze(source, "query.py", "python")
+    assert any(f.rule_id == "OH1" for f in findings)
+
+
+def test_wildcard_driver_import_keeps_lexical_finding() -> None:
+    source = _database_source(
+        'from psycopg import *\ncursor.execute("SELECT name FROM users WHERE id = %s", (output,))'
+    )
+    assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
