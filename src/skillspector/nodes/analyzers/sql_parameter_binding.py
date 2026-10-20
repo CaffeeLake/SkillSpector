@@ -28,7 +28,6 @@ from skillspector.python_ast import ParsedPythonFile
 
 _MAX_PROOF_NODES = 20_000
 _MAX_ORIGIN_DEPTH = 8
-_MAX_PROOF_WORK = 20_000
 _DRIVERS = frozenset({"sqlite3", "psycopg", "psycopg2"})
 _SQLITE_CONNECT_KEYWORDS = frozenset(
     {
@@ -54,12 +53,13 @@ def _root_name(node: ast.AST) -> str | None:
 class _BindingProof:
     def __init__(self, parsed: ParsedPythonFile) -> None:
         self.parsed = parsed
-        self.parents: dict[ast.AST, ast.AST] = {}
         self.nodes: list[ast.AST] = []
         self.bindings: dict[str, list[tuple[ast.AST, ast.AST | _Origin | None]]] = defaultdict(list)
         self.invalid: set[str] = set()
         self.complete = False
-        self.remaining_work = _MAX_PROOF_WORK
+        self.passive_calls: set[ast.Call] = set()
+        self.valid_connections: dict[ast.Call, bool] = {}
+        values: dict[ast.AST, ast.AST] = {}
         assert parsed.tree is not None
         stack: list[ast.AST] = [parsed.tree]
         while stack:
@@ -67,19 +67,16 @@ class _BindingProof:
             self.nodes.append(node)
             if len(self.nodes) > _MAX_PROOF_NODES:
                 return
-            for child in ast.iter_child_nodes(node):
-                self.parents[child] = node
-                stack.append(child)
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                    values[targets[0]] = node.value
+            elif isinstance(node, ast.withitem) and isinstance(node.optional_vars, ast.Name):
+                values[node.optional_vars] = node.context_expr
+            stack.extend(ast.iter_child_nodes(node))
         for node in self.nodes:
             if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                parent = self.parents.get(node)
-                value: ast.AST | _Origin | None = None
-                if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is not None:
-                    if isinstance(parent, ast.AnnAssign) or len(parent.targets) == 1:
-                        value = parent.value
-                elif isinstance(parent, ast.withitem) and parent.optional_vars is node:
-                    value = parent.context_expr
-                self.bindings[node.id].append((node, value))
+                self.bindings[node.id].append((node, values.get(node)))
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     name = alias.asname or alias.name.split(".")[0]
@@ -127,26 +124,6 @@ class _BindingProof:
                     pending.append(alias_name)
         self.complete = True
 
-    def _scope(self, node: ast.AST) -> ast.AST | None:
-        current = self.parents.get(node)
-        while current is not None:
-            if isinstance(
-                current,
-                (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
-            ):
-                return current
-            current = self.parents.get(current)
-        return None
-
-    def _visible(self, binding: ast.AST, use: ast.AST) -> bool:
-        scope = self._scope(binding)
-        current: ast.AST | None = use
-        while current is not None:
-            if current is scope:
-                return True
-            current = self.parents.get(current)
-        return False
-
     @staticmethod
     def _position(node: ast.AST) -> tuple[int, int]:
         return getattr(node, "lineno", 0), getattr(node, "col_offset", 0)
@@ -159,7 +136,7 @@ class _BindingProof:
             if node.id in self.invalid or len(entries) != 1:
                 return None
             binding, value = entries[0]
-            if self._position(binding) >= self._position(node) or not self._visible(binding, node):
+            if self._position(binding) >= self._position(node):
                 return None
             if isinstance(value, tuple):
                 return value
@@ -171,17 +148,20 @@ class _BindingProof:
         if isinstance(node, ast.Call):
             connector = self.origin(node.func, depth + 1)
             if connector is not None and connector[1] == "connector":
-                if len(node.args) > 1 or any(isinstance(arg, ast.Starred) for arg in node.args):
-                    return None
-                if any(
-                    keyword.arg is None or "factory" in keyword.arg for keyword in node.keywords
-                ):
-                    return None
-                if connector[0] == "sqlite3" and any(
-                    keyword.arg not in _SQLITE_CONNECT_KEYWORDS for keyword in node.keywords
-                ):
-                    return None
-                return connector[0], "connection"
+                if node not in self.valid_connections:
+                    self.valid_connections[node] = (
+                        len(node.args) <= 1
+                        and not any(isinstance(arg, ast.Starred) for arg in node.args)
+                        and all(
+                            keyword.arg is not None
+                            and "factory" not in keyword.arg
+                            and (
+                                connector[0] != "sqlite3" or keyword.arg in _SQLITE_CONNECT_KEYWORDS
+                            )
+                            for keyword in node.keywords
+                        )
+                    )
+                return (connector[0], "connection") if self.valid_connections[node] else None
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "cursor"
@@ -214,15 +194,7 @@ class _BindingProof:
             )
         return False
 
-    def _spend_work(self) -> bool:
-        if self.remaining_work <= 0:
-            return False
-        self.remaining_work -= 1
-        return True
-
     def _passive_expression(self, node: ast.AST) -> bool:
-        if not self._spend_work():
-            return False
         if isinstance(node, (ast.Constant, ast.Name)):
             return True
         if isinstance(node, (ast.Tuple, ast.List)):
@@ -238,46 +210,50 @@ class _BindingProof:
             )
         return isinstance(node, ast.Attribute) and self.origin(node) is not None
 
-    def _passive_prefix(self, statements: list[ast.stmt], call: ast.Call) -> bool:
-        """Accept only straight-line setup and proven DB-API context managers.
+    def _passive_prefix(self, statements: list[ast.stmt]) -> bool:
+        """Prove the module prefix once, stopping at implicit or opaque effects.
 
-        Descriptors, subscripts, operators, decorators and control flow may
-        execute unknown Python implicitly. Retain the lexical warning rather
-        than grow a partial evaluator for those constructs.
+        Commit calls only after their entire expression/context is passive.
+        Unsupported statements stop later proofs, including outside nested withs.
         """
         for statement in statements:
-            if not self._spend_work():
-                return False
-            if self._position(statement) > self._position(call):
-                break
             if isinstance(statement, ast.Import):
                 if any(alias.name not in _DRIVERS for alias in statement.names):
                     return False
-            elif isinstance(statement, ast.ImportFrom):
+                continue
+            if isinstance(statement, ast.ImportFrom):
                 if (
                     statement.level != 0
                     or statement.module not in _DRIVERS | {"__future__"}
                     or any(alias.name == "*" for alias in statement.names)
                 ):
                     return False
-            elif isinstance(statement, ast.Assign):
+                continue
+            if isinstance(statement, ast.Assign):
                 if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
                     return False
-                if not self._passive_expression(statement.value):
-                    return False
+                expressions = [statement.value]
             elif isinstance(statement, ast.Expr):
-                if not self._passive_expression(statement.value):
-                    return False
+                expressions = [statement.value]
             elif isinstance(statement, ast.With):
-                for item in statement.items:
-                    origin = self.origin(item.context_expr)
-                    if origin is None or origin[1] not in {"connection", "cursor"}:
-                        return False
-                    if not self._passive_expression(item.context_expr):
-                        return False
-                if not self._passive_prefix(statement.body, call):
+                expressions = [item.context_expr for item in statement.items]
+                if any(
+                    (origin := self.origin(expression)) is None
+                    or origin[1] not in {"connection", "cursor"}
+                    for expression in expressions
+                ):
                     return False
             else:
+                return False
+            if not all(self._passive_expression(expression) for expression in expressions):
+                return False
+            self.passive_calls.update(
+                node
+                for expression in expressions
+                for node in ast.walk(expression)
+                if isinstance(node, ast.Call)
+            )
+            if isinstance(statement, ast.With) and not self._passive_prefix(statement.body):
                 return False
         return True
 
@@ -312,10 +288,12 @@ class _BindingProof:
             for node in calls
         ):
             return ()
+        assert self.parsed.tree is not None
+        self._passive_prefix(self.parsed.tree.body)
         spans = []
         for call in calls:
-            if self.remaining_work <= 0:
-                break
+            if call not in self.passive_calls:
+                continue
             if not isinstance(call.func, ast.Attribute) or call.func.attr != "execute":
                 continue
             owner = self.origin(call.func.value)
@@ -345,9 +323,6 @@ class _BindingProof:
             # The old regex can consume an outer call through a nested unsafe
             # call. Keep that lexical finding rather than hide its only match.
             if any(isinstance(node, ast.Call) for node in ast.walk(params)):
-                continue
-            assert self.parsed.tree is not None
-            if not self._passive_prefix(self.parsed.tree.body, call):
                 continue
             function_span, call_span = self._span(call.func), self._span(call)
             if function_span is not None and call_span is not None:

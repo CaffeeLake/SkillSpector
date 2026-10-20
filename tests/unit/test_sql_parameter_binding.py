@@ -222,12 +222,18 @@ def test_conditional_driver_binding_stays_conservative() -> None:
     assert any(f.rule_id == "OH1" for f in output_handling.analyze(source, "query.py", "python"))
 
 
-def test_many_queries_exhaust_optional_precision_proof_conservatively() -> None:
+def test_many_bound_queries_preserve_trailing_sql_injection() -> None:
     source = _database_source(
         'cursor.execute("SELECT name FROM users WHERE id = %s", (output,))\n' * 1000
+        + 'cursor.execute("SELECT name FROM users WHERE id = " + output)'
     )
-    findings = output_handling.analyze(source, "query.py", "python")
-    assert any(f.rule_id == "OH1" for f in findings)
+    findings = [
+        finding
+        for finding in output_handling.analyze(source, "query.py", "python")
+        if finding.rule_id == "OH1"
+    ]
+    assert len(findings) == 1
+    assert " + output" in (findings[0].matched_text or "")
 
 
 def test_wildcard_driver_import_keeps_lexical_finding() -> None:
