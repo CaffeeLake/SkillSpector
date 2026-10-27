@@ -247,6 +247,9 @@ def _tokens(
                 width = 2
             cursor += width
             operator = content[start:cursor]
+            if operator == "!" and not expression_start:
+                # TypeScript's postfix assertion leaves division possible.
+                return None
             if operator in "([{":
                 if len(stack) >= _MAX_NESTING:
                     return None

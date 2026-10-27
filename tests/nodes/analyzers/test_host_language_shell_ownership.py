@@ -474,13 +474,10 @@ def _javascript(content: str, *, complete_context: bool = True) -> bool:
         "import * as check from 'node:assert/strict';",
     ],
 )
-@pytest.mark.parametrize("file_type", ["javascript", "typescript"])
-def test_imported_node_assert_message_template_is_complete(
-    declaration: str, file_type: str
-) -> None:
+def test_imported_node_assert_message_template_is_complete(declaration: str) -> None:
     source = declaration + "\n" + _JS_ASSERT_CALL
 
-    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type) is False
+    assert _javascript(source) is False
     assert _shell(source) is True
 
 
@@ -508,7 +505,7 @@ def test_node_assert_owns_only_its_message_argument(method: str, arguments: str)
     assert _javascript(source) is False
 
 
-@pytest.mark.parametrize("suffix", [".js", ".mjs", ".cjs", ".ts", ".MJS"])
+@pytest.mark.parametrize("suffix", [".js", ".mjs", ".cjs", ".MJS"])
 def test_node_assert_message_ownership_reaches_static_ledger(suffix: str) -> None:
     result = _ledger("scripts/check" + suffix, _JS_ASSERT_IMPORT + _JS_ASSERT_CALL)
 
@@ -682,6 +679,63 @@ def test_unproven_node_assert_binding_or_message_is_not_projected(source: str) -
 
     assert assertion_template_shell_text(source, lambda: None) == source
     assert _javascript(source) is _shell(source)
+
+
+@pytest.mark.parametrize(
+    "operand",
+    [
+        "value!",
+        "value !",
+        "value /* gap */ !",
+        "value! /* gap */",
+        "holder.value!",
+        "getValue()!",
+        "(value)!",
+        "values[0]!",
+    ],
+)
+@pytest.mark.parametrize("file_type", ["javascript", "typescript"])
+def test_postfix_non_null_assertion_cannot_hide_receiver_mutation(
+    operand: str, file_type: str
+) -> None:
+    from skillspector.javascript_tokens import assertion_template_shell_text
+
+    source = (
+        _JS_ASSERT_IMPORT
+        + f"const n = {operand} / (check.equal = run) / divisor;\n"
+        + _JS_ASSERT_CALL
+    )
+
+    assert assertion_template_shell_text(source, lambda: None) == source
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type=file_type) is True
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["!value", "!!value", "!/value/.test(input)", "value != other", "value !== other"],
+)
+def test_prefix_negation_and_inequality_keep_assert_message_ownership(expression: str) -> None:
+    source = _JS_ASSERT_IMPORT + f"const ready = {expression};\n" + _JS_ASSERT_CALL
+
+    assert _javascript(source) is False
+    assert _shell(source) is True
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "",
+        "const n = value! / (check.equal = run) / divisor;\n",
+        "const n = factory<number> / (check.equal = run) / divisor;\n",
+    ],
+)
+def test_typescript_does_not_borrow_javascript_assert_ownership(statement: str) -> None:
+    source = _JS_ASSERT_IMPORT + statement + _JS_ASSERT_CALL
+
+    assert tm.has_bounded_parse_exhaustion(source, lambda: None, file_type="typescript") is True
+    result = _ledger("scripts/check.ts", source)
+    assert result["inspection_ledger"][0]["outcome"] is LedgerOutcome.PARTIAL
+    assert result["inspection_ledger"][0]["reason_code"] is LedgerReason.STATIC_PARSE_LIMIT
 
 
 @pytest.mark.parametrize(

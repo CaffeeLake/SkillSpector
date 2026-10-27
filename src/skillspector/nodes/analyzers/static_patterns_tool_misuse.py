@@ -5271,9 +5271,10 @@ def _has_bounded_parse_exhaustion(
         )
     # Diagnostic template delimiters belong to JavaScript only when the whole
     # source proves their assertion-message owner. Destructive checks stay raw.
+    # TypeScript's postfix/type expressions need a separate lexical proof.
     shell_word_content = (
         assertion_template_shell_text(content, check_runtime)
-        if file_type in {"javascript", "typescript"} and complete_context
+        if file_type == "javascript" and complete_context
         else content
     )
     # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
